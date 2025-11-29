@@ -1,8 +1,15 @@
-//Hostel Owner Controller 
 const Hostel = require('../models/Hostel');
 const Room = require('../models/Room');
 const cloudinary = require('../config/cloudinary');
 const User = require('../models/User');
+const DeletionRequest = require('../models/DeletionRequest');
+const Contract = require('../models/Contract');
+const Feedback = require('../models/Feedback');
+const axios = require('axios');
+const FormData = require('form-data');
+
+// Panorama service URL from environment
+const PANORAMA_SERVICE_URL = process.env.PANORAMA_SERVICE_URL || 'http://localhost:5001';
 
 // @desc    Create new hostel
 // @route   POST /api/owner/hostels
@@ -320,6 +327,16 @@ const deleteRoom = async (req, res) => {
       return res.status(403).json({ success: false, message: 'Not authorized' });
     }
 
+    // Delete panorama from Cloudinary if exists
+    if (room.panorama?.publicId) {
+      try {
+        await cloudinary.uploader.destroy(room.panorama.publicId);
+        console.log('Deleted panorama from Cloudinary:', room.panorama.publicId);
+      } catch (deleteError) {
+        console.error('Error deleting panorama:', deleteError.message);
+      }
+    }
+
     await room.deleteOne();
 
     // Update hostel counters
@@ -402,6 +419,67 @@ const uploadRoomMedia = async (req, res) => {
         stream.end(files.view360[0].buffer);
       });
       room.view360Url = view360Result;
+    }
+
+    // Handle panorama upload - send to Python service then upload to Cloudinary
+    if (files.panorama && files.panorama[0]) {
+      try {
+        // Delete old panorama from Cloudinary if exists
+        if (room.panorama?.publicId) {
+          try {
+            await cloudinary.uploader.destroy(room.panorama.publicId);
+            console.log('Deleted old panorama from Cloudinary:', room.panorama.publicId);
+          } catch (deleteError) {
+            console.error('Error deleting old panorama:', deleteError.message);
+          }
+        }
+        
+        const formData = new FormData();
+        formData.append('file', files.panorama[0].buffer, files.panorama[0].originalname);
+        formData.append('width', '4096'); // High quality for Three.js
+        
+        const panoramaResponse = await axios.post(
+          `${PANORAMA_SERVICE_URL}/stitch-base64`,
+          formData,
+          {
+            headers: formData.getHeaders(),
+            maxContentLength: Infinity,
+            maxBodyLength: Infinity,
+            timeout: 60000, // 60 second timeout
+          }
+        );
+
+        if (panoramaResponse.data.success && panoramaResponse.data.imageBase64) {
+          // Upload base64 image to Cloudinary
+          const cloudinaryResult = await cloudinary.uploader.upload(
+            `data:image/jpeg;base64,${panoramaResponse.data.imageBase64}`,
+            {
+              resource_type: 'image',
+              folder: 'safestay/rooms/panoramas',
+              transformation: [
+                { quality: 'auto:good' },
+                { fetch_format: 'auto' }
+              ]
+            }
+          );
+
+          room.panorama = {
+            url: cloudinaryResult.secure_url,
+            publicId: cloudinaryResult.public_id,
+            originalFilename: files.panorama[0].originalname,
+            uploadedAt: new Date(),
+            dimensions: {
+              width: panoramaResponse.data.width,
+              height: panoramaResponse.data.height
+            }
+          };
+          
+          console.log('Panorama uploaded to Cloudinary:', cloudinaryResult.public_id);
+        }
+      } catch (panoramaError) {
+        console.error('Panorama upload error:', panoramaError.message);
+        // Continue without panorama if it fails
+      }
     }
     
     await room.save();
@@ -580,6 +658,242 @@ const terminateTenantContract = async (req, res) => {
   }
 };
 
+// @desc    Get deletion requests for owner's hostels
+// @route   GET /api/owner/deletion-requests
+// @access  Private/Owner
+const getDeletionRequests = async (req, res) => {
+  try {
+    const { status } = req.query;
+    
+    const query = { owner: req.user.id };
+    if (status) {
+      query.status = status;
+    }
+
+    const deletionRequests = await DeletionRequest.find(query)
+      .populate('tenant', 'name email phone')
+      .populate('hostel', 'name address')
+      .populate('contract', 'contractNumber monthlyRent startDate endDate')
+      .sort({ requestedAt: -1 });
+
+    res.json({ success: true, data: deletionRequests });
+  } catch (error) {
+    console.error('Get deletion requests error:', error);
+    res.status(500).json({ success: false, message: error.message });
+  }
+};
+
+// @desc    Approve deletion request and delete tenant account
+// @route   PUT /api/owner/deletion-requests/:id/approve
+// @access  Private/Owner
+const approveDeletionRequest = async (req, res) => {
+  try {
+    const { message } = req.body;
+
+    const deletionRequest = await DeletionRequest.findOne({
+      _id: req.params.id,
+      owner: req.user.id,
+      status: 'pending'
+    });
+
+    if (!deletionRequest) {
+      return res.status(404).json({ 
+        success: false, 
+        message: 'Deletion request not found or already processed' 
+      });
+    }
+
+    // Update deletion request status
+    deletionRequest.status = 'approved';
+    deletionRequest.ownerResponse = {
+      message: message || 'Deletion request approved',
+      respondedAt: new Date()
+    };
+    await deletionRequest.save();
+
+    // Update contracts to terminated before deleting user
+    await Contract.updateMany(
+      { tenant: deletionRequest.tenant, status: 'active' },
+      { status: 'terminated' }
+    );
+
+    // Remove tenant from room
+    if (deletionRequest.contract) {
+      const contract = await Contract.findById(deletionRequest.contract);
+      if (contract && contract.room) {
+        const room = await Room.findById(contract.room);
+        if (room) {
+          room.tenants = room.tenants.filter(t => t.toString() !== deletionRequest.tenant.toString());
+          room.currentOccupancy = Math.max(0, room.currentOccupancy - 1);
+          await room.save();
+        }
+      }
+    }
+
+    // Populate tenant info before deletion for response
+    await deletionRequest.populate([
+      { path: 'tenant', select: 'name email phone' },
+      { path: 'hostel', select: 'name address' }
+    ]);
+
+    const deletionResponse = {
+      success: true,
+      message: 'Deletion request approved and tenant account deleted',
+      data: deletionRequest
+    };
+
+    // Actually delete the tenant account (allows re-registration with same email)
+    await User.findByIdAndDelete(deletionRequest.tenant);
+
+    res.json(deletionResponse);
+  } catch (error) {
+    console.error('Approve deletion request error:', error);
+    res.status(500).json({ success: false, message: error.message });
+  }
+};
+
+// @desc    Reject deletion request
+// @route   PUT /api/owner/deletion-requests/:id/reject
+// @access  Private/Owner
+const rejectDeletionRequest = async (req, res) => {
+  try {
+    const { message } = req.body;
+
+    if (!message || message.trim().length === 0) {
+      return res.status(400).json({ 
+        success: false, 
+        message: 'Rejection reason is required' 
+      });
+    }
+
+    const deletionRequest = await DeletionRequest.findOne({
+      _id: req.params.id,
+      owner: req.user.id,
+      status: 'pending'
+    });
+
+    if (!deletionRequest) {
+      return res.status(404).json({ 
+        success: false, 
+        message: 'Deletion request not found or already processed' 
+      });
+    }
+
+    deletionRequest.status = 'rejected';
+    deletionRequest.ownerResponse = {
+      message: message.trim(),
+      respondedAt: new Date()
+    };
+    await deletionRequest.save();
+
+    await deletionRequest.populate([
+      { path: 'tenant', select: 'name email phone' },
+      { path: 'hostel', select: 'name address' }
+    ]);
+
+    res.json({ 
+      success: true, 
+      message: 'Deletion request rejected',
+      data: deletionRequest 
+    });
+  } catch (error) {
+    console.error('Reject deletion request error:', error);
+    res.status(500).json({ success: false, message: error.message });
+  }
+};
+
+// @desc    Get feedbacks for owner's hostels (latest rating per tenant only)
+// @route   GET /api/owner/feedbacks
+// @access  Private/Owner
+const getHostelFeedbacks = async (req, res) => {
+  try {
+    // Get all hostels owned by this owner
+    const hostels = await Hostel.find({ owner: req.user.id }).select('_id name');
+    const hostelIds = hostels.map(h => h._id);
+
+    // Get all feedbacks for these hostels, grouped by user and hostel
+    // For each user-hostel combination, only get the latest feedback
+    const feedbacks = await Feedback.aggregate([
+      {
+        $match: {
+          targetType: 'hostel',
+          targetId: { $in: hostelIds }
+        }
+      },
+      // Sort by createdAt descending to get latest first
+      {
+        $sort: { createdAt: -1 }
+      },
+      // Group by user and targetId (hostel) to get only the latest feedback per user per hostel
+      {
+        $group: {
+          _id: {
+            user: '$user',
+            targetId: '$targetId'
+          },
+          doc: { $first: '$$ROOT' } // Take the first (latest) document
+        }
+      },
+      // Replace root with the document
+      {
+        $replaceRoot: { newRoot: '$doc' }
+      },
+      // Sort again by createdAt descending for display
+      {
+        $sort: { createdAt: -1 }
+      }
+    ]);
+
+    // Populate user and targetId fields manually since aggregate doesn't support populate
+    await Feedback.populate(feedbacks, [
+      { path: 'user', select: 'name email' },
+      { path: 'targetId', select: 'name address' }
+    ]);
+
+    res.json({ success: true, data: feedbacks });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+};
+
+// @desc    Delete room panorama
+// @route   DELETE /api/owner/rooms/:id/panorama
+// @access  Private/Owner
+const deleteRoomPanorama = async (req, res) => {
+  try {
+    const room = await Room.findById(req.params.id).populate('hostel');
+    
+    if (!room) {
+      return res.status(404).json({ success: false, message: 'Room not found' });
+    }
+    
+    if (room.hostel.owner.toString() !== req.user.id) {
+      return res.status(403).json({ success: false, message: 'Not authorized' });
+    }
+
+    if (!room.panorama || !room.panorama.filename) {
+      return res.status(404).json({ success: false, message: 'No panorama found' });
+    }
+
+    // Delete from Python service
+    try {
+      await axios.delete(`${PANORAMA_SERVICE_URL}/panorama/${room.panorama.filename}`);
+    } catch (deleteError) {
+      console.error('Failed to delete panorama from service:', deleteError.message);
+      // Continue even if deletion fails on the service
+    }
+
+    // Remove from database
+    room.panorama = undefined;
+    await room.save();
+
+    res.json({ success: true, message: 'Panorama deleted successfully' });
+  } catch (error) {
+    console.error('Delete panorama error:', error);
+    res.status(500).json({ success: false, message: error.message });
+  }
+};
+
 module.exports = {
   createHostel,
   getMyHostels,
@@ -592,8 +906,13 @@ module.exports = {
   updateRoom,
   deleteRoom,
   uploadRoomMedia,
+  deleteRoomPanorama,
   getMyTenants,
   getHostelTenants,
   approveTenantContract,
   terminateTenantContract,
+  getDeletionRequests,
+  approveDeletionRequest,
+  rejectDeletionRequest,
+  getHostelFeedbacks,
 };

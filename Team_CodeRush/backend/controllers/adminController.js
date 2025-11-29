@@ -1,4 +1,3 @@
-//admin controller
 const User = require('../models/User');
 const Hostel = require('../models/Hostel');
 const sendEmail = require('../utils/sendEmail');

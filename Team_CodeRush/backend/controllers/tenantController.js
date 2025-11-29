@@ -1,21 +1,38 @@
-//Tenat Contoller 
 const Hostel = require('../models/Hostel');
 const Room = require('../models/Room');
 const Order = require('../models/Order');
 const Expense = require('../models/Expense');
 const Feedback = require('../models/Feedback');
 const Contract = require('../models/Contract');
+const DeletionRequest = require('../models/DeletionRequest');
+const User = require('../models/User');
+const SOS = require('../models/SOS');
+const { sendSMS } = require('../utils/sendSMS');
+const { sendEmail } = require('../utils/sendEmail');
 
 // @desc    Search hostels
-// @route   GET /api/tenant/hostels/search
-// @access  Private/Tenant
+// @route   GET /api/tenant/hostels/search OR /api/hostels/search (public)
+// @access  Private/Tenant or Public
 const searchHostels = async (req, res) => {
   try {
-    const { city, hostelType, minPrice, maxPrice, page = 1, limit = 10, showAll } = req.query;
+    const { city, hostelType, minPrice, maxPrice, page = 1, limit = 10, showAll, search } = req.query;
     
-    // If showAll is true, don't filter by verification status (useful for testing/first-time users)
-    const query = showAll === 'true' ? {} : { verificationStatus: 'verified', isActive: true };
+    // If showAll is true or user is not authenticated, don't filter by verification status
+    const isPublicAccess = !req.user;
+    const query = (showAll === 'true' || isPublicAccess) ? {} : { verificationStatus: 'verified', isActive: true };
 
+    // Handle general search parameter (case-insensitive search across name, city, state)
+    if (search) {
+      const searchRegex = new RegExp(search, 'i');
+      query.$or = [
+        { name: searchRegex },
+        { 'address.city': searchRegex },
+        { 'address.state': searchRegex },
+        { city: searchRegex },
+        { state: searchRegex }
+      ];
+    }
+    
     if (city) query['address.city'] = new RegExp(city, 'i');
     if (hostelType) query.hostelType = hostelType;
     if (minPrice || maxPrice) {
@@ -25,21 +42,30 @@ const searchHostels = async (req, res) => {
 
     let hostels = await Hostel.find(query)
       .populate('owner', 'name phone')
-      .populate('canteen', 'name deliveryCharge subscriptionPlans')
       .limit(limit * 1)
       .skip((page - 1) * limit)
       .sort({ rating: -1 });
 
-    // If no verified hostels found, try getting all hostels
+    // If no verified hostels found, try getting all hostels with location data
     if (hostels.length === 0 && showAll !== 'true') {
       console.log('No verified hostels found, fetching all hostels...');
       hostels = await Hostel.find({})
         .populate('owner', 'name phone')
-        .populate('canteen', 'name deliveryCharge subscriptionPlans')
         .limit(limit * 1)
         .skip((page - 1) * limit)
         .sort({ rating: -1 });
     }
+    
+    // Log hostel data for debugging
+    console.log(`Found ${hostels.length} hostels`)
+    hostels.forEach((h, idx) => {
+      console.log(`Hostel ${idx + 1}: ${h.name}`)
+      console.log(`  - Location: ${JSON.stringify(h.location)}`)
+      console.log(`  - Photos: ${h.photos?.length || 0} photos`)
+      if (h.photos?.length > 0) {
+        console.log(`  - First photo URL: ${h.photos[0].url}`)
+      }
+    })
 
     const count = await Hostel.countDocuments(query);
 
@@ -83,47 +109,16 @@ const getHostelDetails = async (req, res) => {
 // @access  Private/Tenant
 const getMyExpenses = async (req, res) => {
   try {
-    console.log('📋 Fetching expenses for tenant:', req.user.id)
-    
-    const { year, month, type, status } = req.query;
+    const { year, month } = req.query;
     const query = { tenant: req.user.id };
 
     if (year) query.year = parseInt(year);
     if (month) query.month = parseInt(month);
-    if (type) query.type = type;
-    if (status) query.status = status;
 
-    // Fetch both new format and old format expenses
-    const expenses = await Expense.find(query)
-      .populate('tenant', 'name email phone')
-      .sort({ createdAt: -1, dueDate: -1 });
+    const expenses = await Expense.find(query).sort({ year: -1, month: -1 });
 
-    console.log('✓ Found', expenses.length, 'expenses for tenant')
-
-    // Transform old format to new format for backward compatibility
-    const transformedExpenses = expenses.map(exp => {
-      if (exp.type) {
-        // Already in new format
-        return exp.toObject();
-      } else {
-        // Old format - transform it
-        return {
-          _id: exp._id,
-          tenant: exp.tenant,
-          type: 'other',
-          name: `Monthly Expenses - ${exp.month}/${exp.year}`,
-          description: exp.notes || 'Monthly expenses',
-          amount: exp.totalExpense || 0,
-          status: 'paid', // Old expenses are considered paid
-          dueDate: new Date(exp.year, exp.month - 1, 1),
-          createdAt: exp.createdAt,
-        };
-      }
-    });
-
-    res.json({ success: true, data: transformedExpenses });
+    res.json({ success: true, data: expenses });
   } catch (error) {
-    console.error('❌ Error fetching expenses:', error);
     res.status(500).json({ success: false, message: error.message });
   }
 };
@@ -133,20 +128,50 @@ const getMyExpenses = async (req, res) => {
 // @access  Private/Tenant
 const addExpense = async (req, res) => {
   try {
-    const { month, year, rent, electricity, water, food, maintenance, other } = req.body;
+    const { month, year, rent, electricity, water, food, maintenance, other, notes } = req.body;
+
+    console.log('Adding expense for user:', req.user.id);
+    console.log('Expense data:', { month, year, rent, electricity, water, food, maintenance, other, notes });
 
     const totalExpense = (rent || 0) + (electricity || 0) + (water || 0) + 
                         (food || 0) + (maintenance || 0) + 
-                        (other || []).reduce((sum, item) => sum + item.amount, 0);
+                        (other || []).reduce((sum, item) => sum + (item.amount || 0), 0);
 
     const expense = await Expense.findOneAndUpdate(
       { tenant: req.user.id, month, year },
-      { rent, electricity, water, food, maintenance, other, totalExpense },
+      { rent, electricity, water, food, maintenance, other, totalExpense, notes },
       { new: true, upsert: true, runValidators: true }
     );
 
+    console.log('Expense saved:', expense);
+
     res.status(201).json({ success: true, data: expense });
   } catch (error) {
+    console.error('Error adding expense:', error);
+    res.status(500).json({ success: false, message: error.message });
+  }
+};
+
+// @desc    Delete expense
+// @route   DELETE /api/tenant/expenses/:id
+// @access  Private/Tenant
+const deleteExpense = async (req, res) => {
+  try {
+    const expense = await Expense.findById(req.params.id);
+
+    if (!expense) {
+      return res.status(404).json({ success: false, message: 'Expense not found' });
+    }
+
+    if (expense.tenant.toString() !== req.user.id) {
+      return res.status(403).json({ success: false, message: 'Not authorized to delete this expense' });
+    }
+
+    await Expense.findByIdAndDelete(req.params.id);
+
+    res.json({ success: true, message: 'Expense deleted successfully' });
+  } catch (error) {
+    console.error('Error deleting expense:', error);
     res.status(500).json({ success: false, message: error.message });
   }
 };
@@ -158,22 +183,59 @@ const submitFeedback = async (req, res) => {
   try {
     const { targetType, targetId, rating, comment } = req.body;
 
-    const feedback = await Feedback.create({
+    console.log('Submit feedback request:', { targetType, targetId, rating, comment, userId: req.user.id });
+
+    // Check if user already has feedback for this target
+    let feedback = await Feedback.findOne({
       user: req.user.id,
       targetType,
-      targetId,
-      rating,
-      comment,
+      targetId
     });
+
+    console.log('Existing feedback found:', feedback);
+
+    if (feedback) {
+      // Update existing feedback
+      console.log('Updating existing feedback...');
+      feedback.rating = rating;
+      feedback.comment = comment;
+      await feedback.save();
+      console.log('Feedback updated:', feedback);
+    } else {
+      // Create new feedback
+      console.log('Creating new feedback...');
+      feedback = await Feedback.create({
+        user: req.user.id,
+        targetType,
+        targetId,
+        rating,
+        comment,
+      });
+      console.log('Feedback created:', feedback);
+    }
 
     // Update rating for target
     if (targetType === 'hostel') {
       const hostel = await Hostel.findById(targetId);
-      const feedbacks = await Feedback.find({ targetType: 'hostel', targetId });
-      const avgRating = feedbacks.reduce((sum, f) => sum + f.rating, 0) / feedbacks.length;
+      
+      // Get all unique feedbacks (latest per user)
+      const allFeedbacks = await Feedback.find({ targetType: 'hostel', targetId });
+      
+      // Group by user and get only latest feedback per user
+      const latestFeedbacksMap = new Map();
+      allFeedbacks.forEach(fb => {
+        const userId = fb.user.toString();
+        const existing = latestFeedbacksMap.get(userId);
+        if (!existing || new Date(fb.updatedAt) > new Date(existing.updatedAt)) {
+          latestFeedbacksMap.set(userId, fb);
+        }
+      });
+      
+      const latestFeedbacks = Array.from(latestFeedbacksMap.values());
+      const avgRating = latestFeedbacks.reduce((sum, f) => sum + f.rating, 0) / latestFeedbacks.length;
       
       hostel.rating = avgRating;
-      hostel.reviewCount = feedbacks.length;
+      hostel.reviewCount = latestFeedbacks.length;
       await hostel.save();
     }
 
@@ -304,6 +366,19 @@ const bookRoom = async (req, res) => {
       });
     }
 
+    // Validate minimum booking duration (1 month)
+    const start = new Date(startDate);
+    const end = endDate ? new Date(endDate) : new Date(start.setMonth(start.getMonth() + 11));
+    const diffTime = Math.abs(end - new Date(startDate));
+    const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
+    
+    if (diffDays < 30) {
+      return res.status(400).json({ 
+        success: false, 
+        message: 'Minimum booking duration is 1 month (30 days)' 
+      });
+    }
+
     // Verify payment signature
     const { razorpay_order_id, razorpay_payment_id, razorpay_signature } = paymentDetails;
     
@@ -378,11 +453,14 @@ const bookRoom = async (req, res) => {
       ],
     });
 
-    
+    // DON'T update room or hostel immediately - only update when owner approves the contract
+    // Room occupancy, tenant list, and availability will be updated in approveTenantContract
+    // This prevents rooms from being marked unavailable for pending bookings that may be rejected
 
     // Store payment details in contract
     contract.paymentId = razorpay_payment_id;
     contract.orderId = razorpay_order_id;
+    contract.paymentStatus = 'paid';
     await contract.save();
 
     // Send notification email to owner
@@ -439,177 +517,390 @@ const bookRoom = async (req, res) => {
   }
 };
 
-// @desc    Create payment order for expenses
-// @route   POST /api/tenant/create-expense-order
+// @desc    Submit feedback for an order
+// @route   POST /api/tenant/orders/:orderId/feedback
 // @access  Private/Tenant
-const createExpenseOrder = async (req, res) => {
+const submitOrderFeedback = async (req, res) => {
   try {
-    const { expenseIds, amount } = req.body;
+    const { orderId } = req.params;
+    const { rating, comment } = req.body;
 
-    console.log('📝 Creating expense order - expenseIds:', expenseIds, 'amount:', amount)
-
-    if (!expenseIds || !Array.isArray(expenseIds) || expenseIds.length === 0) {
-      console.warn('⚠️ Invalid expenseIds:', expenseIds)
-      return res.status(400).json({ success: false, message: 'Expense IDs are required' });
+    // Verify order exists and belongs to user
+    const order = await Order.findById(orderId);
+    if (!order) {
+      return res.status(404).json({ success: false, message: 'Order not found' });
     }
 
-    if (!amount || amount <= 0) {
-      console.warn('⚠️ Invalid amount:', amount)
-      return res.status(400).json({ success: false, message: 'Valid amount is required' });
+    if (order.tenant.toString() !== req.user.id) {
+      return res.status(403).json({ success: false, message: 'Not authorized to provide feedback for this order' });
     }
 
-    // Check if Razorpay is configured
-    const razorpay = require('../config/razorypay');
-    if (!razorpay) {
-      console.log('ℹ️ Razorpay not configured, returning test order')
-      // If Razorpay not configured, return test order
-      return res.status(200).json({
-        success: true,
-        testMode: true,
-        order: {
-          id: `test_expense_order_${Date.now()}`,
-          amount: amount,
-          currency: 'INR',
-          expenseIds: expenseIds
-        },
-        razorpayKeyId: 'test_key',
-        message: 'Test mode - Razorpay not configured'
+    // Check if order is delivered
+    if (order.orderStatus !== 'delivered') {
+      return res.status(400).json({ success: false, message: 'Can only provide feedback for delivered orders' });
+    }
+
+    // Check if feedback already exists
+    const existingFeedback = await Feedback.findOne({ 
+      targetType: 'order', 
+      targetId: orderId,
+      user: req.user.id 
+    });
+
+    if (existingFeedback) {
+      return res.status(400).json({ success: false, message: 'Feedback already submitted for this order' });
+    }
+
+    // Create feedback
+    const feedback = await Feedback.create({
+      user: req.user.id,
+      targetType: 'order',
+      targetId: orderId,
+      rating,
+      comment,
+    });
+
+    // Update order with feedback reference
+    order.feedback = feedback._id;
+    await order.save();
+
+    // Update canteen average rating
+    const canteenFeedbacks = await Feedback.find({ 
+      targetType: 'order',
+      targetId: { $in: await Order.find({ canteen: order.canteen }).distinct('_id') }
+    });
+    
+    if (canteenFeedbacks.length > 0) {
+      const avgRating = canteenFeedbacks.reduce((sum, f) => sum + f.rating, 0) / canteenFeedbacks.length;
+      const Canteen = require('../models/Canteen');
+      await Canteen.findByIdAndUpdate(order.canteen, { 
+        rating: avgRating,
+        reviewCount: canteenFeedbacks.length 
       });
     }
 
-    const options = {
-      amount: Math.round(amount * 100), // amount in paise
-      currency: 'INR',
-      receipt: `EXP_${Date.now().toString().slice(-10)}`,
-      notes: {
-        expenseIds: expenseIds.join(','),
-        tenantId: req.user.id,
-        type: 'expense_payment'
-      }
-    };
-
-    console.log('📡 Calling Razorpay.orders.create with options:', options)
-    const order = await razorpay.orders.create(options);
-
-    console.log('✓ Razorpay expense order created:', order.id);
-
-    res.status(200).json({
-      success: true,
-      order: {
-        id: order.id,
-        amount: amount,
-        currency: 'INR',
-        expenseIds: expenseIds
-      },
-      razorpayKeyId: process.env.RAZORPAY_KEY_ID
+    res.status(201).json({ 
+      success: true, 
+      message: 'Feedback submitted successfully',
+      data: feedback 
     });
   } catch (error) {
-    console.error('❌ Create expense order error:', error);
-    console.error('Error details:', {
-      message: error.message,
-      statusCode: error.statusCode,
-      code: error.code,
-      stack: error.stack
-    });
-    res.status(500).json({
-      success: false,
-      message: error.message || 'Failed to create payment order',
-      error: process.env.NODE_ENV === 'development' ? error.message : undefined
-    });
+    console.error('Submit order feedback error:', error);
+    res.status(500).json({ success: false, message: error.message });
   }
 };
 
-// @desc    Verify and process expense payment
-// @route   POST /api/tenant/verify-expense-payment
+// @desc    Request account deletion
+// @route   POST /api/tenant/deletion-request
 // @access  Private/Tenant
-const verifyExpensePayment = async (req, res) => {
+const requestAccountDeletion = async (req, res) => {
   try {
-    const { razorpay_order_id, razorpay_payment_id, razorpay_signature, expenseIds } = req.body;
+    const { reason } = req.body;
 
-    console.log('💳 Verifying expense payment...')
-    console.log('Payment ID:', razorpay_payment_id)
-    console.log('Expense IDs:', expenseIds)
-
-    if (!razorpay_order_id || !razorpay_payment_id || !expenseIds) {
-      console.warn('⚠️ Missing payment details')
-      return res.status(400).json({ success: false, message: 'Missing payment details' });
+    if (!reason || reason.trim().length === 0) {
+      return res.status(400).json({ success: false, message: 'Reason for deletion is required' });
     }
 
-    // Skip verification for test mode
-    if (!razorpay_order_id.startsWith('test_expense_order_')) {
-      const crypto = require('crypto');
-      const sign = razorpay_order_id + '|' + razorpay_payment_id;
-      const expectedSign = crypto
-        .createHmac('sha256', process.env.RAZORPAY_KEY_SECRET)
-        .update(sign.toString())
-        .digest('hex');
+    // Get tenant's current hostel from active contract or user profile
+    const tenant = await User.findById(req.user.id);
 
-      if (razorpay_signature !== expectedSign) {
-        console.warn('⚠️ Invalid payment signature')
-        return res.status(400).json({ success: false, message: 'Invalid payment signature' });
+    // Get active contract if exists
+    const contract = await Contract.findOne({
+      tenant: req.user.id,
+      status: 'active'
+    }).populate('hostel owner');
+
+    // Determine hostel and owner from contract or user profile
+    let hostel, owner;
+    
+    if (contract) {
+      hostel = contract.hostel;
+      owner = contract.owner;
+    } else if (tenant.currentHostel) {
+      hostel = await Hostel.findById(tenant.currentHostel);
+      if (hostel) {
+        owner = await User.findById(hostel.owner);
       }
     }
 
-    console.log('✓ Signature verified')
+    if (!hostel || !owner) {
+      return res.status(400).json({ 
+        success: false, 
+        message: 'You must have an active contract or be associated with a hostel to request account deletion' 
+      });
+    }
 
-    // Mark expenses as paid in database
-    const expenseArray = Array.isArray(expenseIds) ? expenseIds : expenseIds.split(',');
+    // Check if there's already a pending request
+    const existingRequest = await DeletionRequest.findOne({
+      tenant: req.user.id,
+      status: 'pending'
+    });
+
+    if (existingRequest) {
+      return res.status(400).json({ 
+        success: false, 
+        message: 'You already have a pending deletion request' 
+      });
+    }
+
+    // Create deletion request
+    const deletionRequest = await DeletionRequest.create({
+      tenant: req.user.id,
+      hostel: hostel._id,
+      owner: owner._id,
+      contract: contract?._id,
+      reason: reason.trim()
+    });
+
+    await deletionRequest.populate([
+      { path: 'tenant', select: 'name email phone' },
+      { path: 'hostel', select: 'name address' },
+      { path: 'owner', select: 'name email phone' }
+    ]);
+
+    res.status(201).json({ 
+      success: true, 
+      message: 'Account deletion request sent to hostel owner',
+      data: deletionRequest 
+    });
+  } catch (error) {
+    console.error('Request account deletion error:', error);
+    res.status(500).json({ success: false, message: error.message });
+  }
+};
+
+// @desc    Get my deletion request status
+// @route   GET /api/tenant/deletion-request
+// @access  Private/Tenant
+const getMyDeletionRequest = async (req, res) => {
+  try {
+    const deletionRequest = await DeletionRequest.findOne({
+      tenant: req.user.id,
+      status: 'pending'
+    })
+      .populate('hostel', 'name address')
+      .populate('owner', 'name phone email');
+
+    res.json({ success: true, data: deletionRequest });
+  } catch (error) {
+    console.error('Get deletion request error:', error);
+    res.status(500).json({ success: false, message: error.message });
+  }
+};
+
+// @desc    Cancel deletion request
+// @route   DELETE /api/tenant/deletion-request/:id
+// @access  Private/Tenant
+const cancelDeletionRequest = async (req, res) => {
+  try {
+    const deletionRequest = await DeletionRequest.findOne({
+      _id: req.params.id,
+      tenant: req.user.id,
+      status: 'pending'
+    });
+
+    if (!deletionRequest) {
+      return res.status(404).json({ 
+        success: false, 
+        message: 'Deletion request not found or already processed' 
+      });
+    }
+
+    await deletionRequest.deleteOne();
+
+    res.json({ 
+      success: true, 
+      message: 'Deletion request cancelled successfully' 
+    });
+  } catch (error) {
+    console.error('Cancel deletion request error:', error);
+    res.status(500).json({ success: false, message: error.message });
+  }
+};
+
+// @desc    Get tenant's feedbacks
+// @route   GET /api/tenant/feedbacks
+// @access  Private/Tenant
+const getMyFeedbacks = async (req, res) => {
+  try {
+    const feedbacks = await Feedback.find({ user: req.user.id })
+      .populate('user', 'name email')
+      .sort('-createdAt');
+
+    // Manually populate targetId based on targetType
+    const Hostel = require('../models/Hostel');
+    const Canteen = require('../models/Canteen');
     
-    console.log('📝 Updating expenses to paid status...')
-    
-    // Update all expenses with matching IDs for this tenant
-    const updateResult = await Expense.updateMany(
-      {
-        _id: { $in: expenseArray },
-        tenant: req.user.id
-      },
-      {
-        status: 'paid',
-        paidDate: new Date(),
-        paymentId: razorpay_payment_id,
-        orderId: razorpay_order_id
-      }
+    const populatedFeedbacks = await Promise.all(
+      feedbacks.map(async (feedback) => {
+        let target = null;
+        if (feedback.targetType === 'hostel') {
+          target = await Hostel.findById(feedback.targetId);
+        } else if (feedback.targetType === 'canteen') {
+          target = await Canteen.findById(feedback.targetId);
+        }
+        
+        return {
+          _id: feedback._id,
+          rating: feedback.rating,
+          comment: feedback.comment,
+          targetType: feedback.targetType,
+          target: target,
+          createdAt: feedback.createdAt,
+          updatedAt: feedback.updatedAt,
+        };
+      })
     );
 
-    console.log('✓ Updated', updateResult.modifiedCount, 'expenses')
-    
-    // Fetch updated expenses to return
-    const updatedExpenses = await Expense.find({
-      _id: { $in: expenseArray },
-      tenant: req.user.id
-    });
-
-    console.log('✓ Payment verified and expenses updated')
-    
-    res.status(200).json({
-      success: true,
-      message: 'Payment verified successfully',
-      data: {
-        orderId: razorpay_order_id,
-        paymentId: razorpay_payment_id,
-        expenseIds: expenseArray,
-        status: 'paid',
-        updatedExpenses: updatedExpenses
-      }
-    });
+    res.status(200).json({ success: true, data: populatedFeedbacks });
   } catch (error) {
-    console.error('❌ Verify expense payment error:', error);
-    res.status(500).json({
-      success: false,
-      message: error.message || 'Failed to verify payment'
-    });
+    console.error('Get feedbacks error:', error);
+    res.status(500).json({ success: false, message: error.message });
   }
 };
-//Exprot all controller functions
+
+// @desc    Send SOS alert
+// @route   POST /api/tenant/sos
+// @access  Private/Tenant
+const sendSOSAlert = async (req, res) => {
+  try {
+    const { type, description, location } = req.body;
+
+    if (!type || !description) {
+      return res.status(400).json({ 
+        success: false, 
+        message: 'Emergency type and description are required' 
+      });
+    }
+
+    // Get tenant's current hostel from active contract
+    const activeContract = await Contract.findOne({
+      tenant: req.user._id,
+      status: 'active'
+    }).populate('hostel');
+
+    const sos = await SOS.create({
+      tenant: req.user._id,
+      hostel: activeContract?.hostel?._id || null,
+      type,
+      description,
+      location: location || 'Current hostel location'
+    });
+
+    // Populate tenant details
+    await sos.populate('tenant', 'name phone email');
+
+    // Get hostel owner details if hostel exists
+    let ownerNotified = false;
+    if (activeContract?.hostel) {
+      const hostel = await Hostel.findById(activeContract.hostel._id).populate('owner', 'name phone email');
+      
+      if (hostel && hostel.owner) {
+        const owner = hostel.owner;
+        const emergencyIcon = type === 'medical' ? '🏥' : type === 'fire' ? '🔥' : type === 'security' ? '🔒' : '⚠️';
+        
+        // Send SMS to hostel owner
+        try {
+          const smsMessage = `🚨 EMERGENCY SOS ALERT ${emergencyIcon}\n\nType: ${type.toUpperCase()}\nTenant: ${req.user.name}\nPhone: ${req.user.phone}\nLocation: ${location || 'Current hostel location'}\nDetails: ${description}\n\nHostel: ${hostel.name}\nPlease respond immediately!`;
+          
+          await sendSMS(owner.phone, smsMessage);
+          console.log(`✓ SMS sent to owner: ${owner.name} (${owner.phone})`);
+          ownerNotified = true;
+        } catch (smsError) {
+          console.error('Failed to send SMS to owner:', smsError.message);
+        }
+
+        // Send Email to hostel owner
+        try {
+          const emailSubject = `🚨 EMERGENCY: ${type.toUpperCase()} SOS Alert from ${req.user.name}`;
+          const emailBody = `
+            <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px; border: 4px solid #dc2626; border-radius: 10px; background: #fef2f2;">
+              <h1 style="color: #dc2626; text-align: center; font-size: 32px;">🚨 EMERGENCY SOS ALERT ${emergencyIcon}</h1>
+              
+              <div style="background: white; padding: 20px; border-radius: 8px; margin: 20px 0;">
+                <h2 style="color: #991b1b; margin-top: 0;">Emergency Details</h2>
+                <table style="width: 100%; border-collapse: collapse;">
+                  <tr><td style="padding: 8px; border-bottom: 1px solid #e5e7eb;"><strong>Type:</strong></td><td style="padding: 8px; border-bottom: 1px solid #e5e7eb; color: #dc2626; font-weight: bold;">${type.toUpperCase()}</td></tr>
+                  <tr><td style="padding: 8px; border-bottom: 1px solid #e5e7eb;"><strong>Tenant:</strong></td><td style="padding: 8px; border-bottom: 1px solid #e5e7eb;">${req.user.name}</td></tr>
+                  <tr><td style="padding: 8px; border-bottom: 1px solid #e5e7eb;"><strong>Phone:</strong></td><td style="padding: 8px; border-bottom: 1px solid #e5e7eb;"><a href="tel:${req.user.phone}">${req.user.phone}</a></td></tr>
+                  <tr><td style="padding: 8px; border-bottom: 1px solid #e5e7eb;"><strong>Email:</strong></td><td style="padding: 8px; border-bottom: 1px solid #e5e7eb;"><a href="mailto:${req.user.email}">${req.user.email}</a></td></tr>
+                  <tr><td style="padding: 8px; border-bottom: 1px solid #e5e7eb;"><strong>Location:</strong></td><td style="padding: 8px; border-bottom: 1px solid #e5e7eb;">${location || 'Current hostel location'}</td></tr>
+                  <tr><td style="padding: 8px; border-bottom: 1px solid #e5e7eb;"><strong>Hostel:</strong></td><td style="padding: 8px; border-bottom: 1px solid #e5e7eb;">${hostel.name}</td></tr>
+                  <tr><td style="padding: 8px; vertical-align: top;"><strong>Description:</strong></td><td style="padding: 8px;">${description}</td></tr>
+                </table>
+              </div>
+              
+              <div style="background: #fef9c3; padding: 15px; border-radius: 8px; border: 2px solid #eab308;">
+                <p style="margin: 0; color: #854d0e;"><strong>⚠️ URGENT ACTION REQUIRED:</strong> Please respond to this emergency immediately. Contact the tenant or visit the location as soon as possible.</p>
+              </div>
+              
+              <div style="text-align: center; margin-top: 20px; color: #6b7280; font-size: 12px;">
+                <p>Alert sent at: ${new Date().toLocaleString()}</p>
+                <p>SafeStay Hub - Emergency Alert System</p>
+              </div>
+            </div>
+          `;
+          
+          await sendEmail(owner.email, emailSubject, emailBody);
+          console.log(`✓ Email sent to owner: ${owner.name} (${owner.email})`);
+        } catch (emailError) {
+          console.error('Failed to send email to owner:', emailError.message);
+        }
+      }
+    }
+
+    // Log to console for immediate visibility
+    console.log(`🚨 EMERGENCY SOS ALERT: ${type} - ${description}`);
+    console.log(`Tenant: ${req.user.name} (${req.user.phone})`);
+    console.log(`Location: ${location || 'Current hostel location'}`);
+    console.log(`Owner notified: ${ownerNotified ? 'Yes' : 'No'}`);
+
+    res.status(201).json({ 
+      success: true, 
+      message: ownerNotified 
+        ? 'SOS alert sent successfully! Hostel owner has been notified via SMS and email.' 
+        : 'SOS alert recorded. Please contact hostel management directly.',
+      data: sos 
+    });
+  } catch (error) {
+    console.error('Send SOS error:', error);
+    res.status(500).json({ success: false, message: error.message });
+  }
+};
+
+// @desc    Get SOS history
+// @route   GET /api/tenant/sos/history
+// @access  Private/Tenant
+const getSOSHistory = async (req, res) => {
+  try {
+    const sosAlerts = await SOS.find({ tenant: req.user._id })
+      .populate('hostel', 'name address')
+      .populate('respondedBy', 'name')
+      .sort({ createdAt: -1 })
+      .limit(50);
+
+    res.status(200).json({ success: true, data: sosAlerts });
+  } catch (error) {
+    console.error('Get SOS history error:', error);
+    res.status(500).json({ success: false, message: error.message });
+  }
+};
+
 module.exports = {
   searchHostels,
   getHostelDetails,
   getMyExpenses,
   addExpense,
+  deleteExpense,
   submitFeedback,
+  submitOrderFeedback,
   getMyContracts,
   createBookingOrder,
   bookRoom,
-  createExpenseOrder,
-  verifyExpensePayment,
+  requestAccountDeletion,
+  getMyDeletionRequest,
+  cancelDeletionRequest,
+  getMyFeedbacks,
+  sendSOSAlert,
+  getSOSHistory,
 };

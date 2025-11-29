@@ -1,9 +1,9 @@
-//auth controller
 const User = require('../models/User');
 const generateToken = require('../utils/generateToken');
 const sendEmail = require('../utils/sendEmail');
 const sendSMS = require('../utils/sendSMS');
 const generateOTP = require('../utils/generateOTP');
+const cloudinary = require('../config/cloudinary');
 
 // Register new user - Now sends OTP for verification
 // @route   POST /api/auth/register
@@ -196,6 +196,13 @@ const verifyOTP = async (req, res) => {
           email: user.email,
           phone: user.phone,
           role: user.role,
+          profileImage: user.profileImage,
+          displayName: user.displayName,
+          bio: user.bio,
+          hobbies: user.hobbies,
+          foodPreferences: user.foodPreferences,
+          isVerified: user.isVerified,
+          phoneVerified: user.phoneVerified,
         },
         token: token,
       },
@@ -241,7 +248,7 @@ const resendOTP = async (req, res) => {
 
     // Generate new OTP
     const otp = generateOTP();
-    const otpExpiry = new Date(Date.now() + 10 * 60 * 1000); // The validation of 10 minutes
+    const otpExpiry = new Date(Date.now() + 10 * 60 * 1000); // 10 minutes
 
     user.otp = otp;
     user.otpExpiry = otpExpiry;
@@ -280,19 +287,28 @@ const login = async (req, res) => {
 
     // Save refresh token to database
     user.refreshToken = refreshToken;
-    user.refreshTokenExpiry = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
+    user.refreshTokenExpiry = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000); // 7 days
     await user.save();
 
     res.json({
       success: true,
       data: {
-        _id: user._id,
-        name: user.name,
-        email: user.email,
-        phone: user.phone,
-        role: user.role,
         token: accessToken,
         refreshToken: refreshToken,
+        user: {
+          _id: user._id,
+          name: user.name,
+          email: user.email,
+          phone: user.phone,
+          role: user.role,
+          profileImage: user.profileImage,
+          displayName: user.displayName,
+          bio: user.bio,
+          hobbies: user.hobbies,
+          foodPreferences: user.foodPreferences,
+          isVerified: user.isVerified,
+          phoneVerified: user.phoneVerified,
+        },
       },
     });
   } catch (error) {
@@ -317,18 +333,142 @@ const getMe = async (req, res) => {
 // @access  Private
 const updateProfile = async (req, res) => {
   try {
-    const { name, phone, foodPreference } = req.body;
+    const { name, email, phone, foodPreference, bio, addressString, city, state, displayName, hobbies, foodPreferences } = req.body;
 
     const user = await User.findById(req.user.id);
-    
+    if (!user) return res.status(404).json({ success: false, message: 'User not found' });
+
+    // Update name if provided
     if (name) user.name = name;
-    if (phone) user.phone = phone;
+    if (typeof displayName !== 'undefined') user.displayName = displayName;
+
+    // Update email with uniqueness check
+    if (email && email !== user.email) {
+      const existing = await User.findOne({ email });
+      if (existing && existing._id.toString() !== user._id.toString()) {
+        return res.status(400).json({ success: false, message: 'Email already in use' });
+      }
+      user.email = email;
+    }
+
+    // Update phone with basic validation and uniqueness
+    if (phone && phone !== user.phone) {
+      if (!/^[0-9]{10}$/.test(phone)) {
+        return res.status(400).json({ success: false, message: 'Phone number must be 10 digits' });
+      }
+      const existingPhone = await User.findOne({ phone });
+      if (existingPhone && existingPhone._id.toString() !== user._id.toString()) {
+        return res.status(400).json({ success: false, message: 'Phone number already in use' });
+      }
+      user.phone = phone;
+    }
+
     if (foodPreference) user.foodPreference = foodPreference;
+    if (typeof bio !== 'undefined') user.bio = bio;
+    if (typeof addressString !== 'undefined') user.addressString = addressString;
+    if (typeof city !== 'undefined') user.city = city;
+    if (typeof state !== 'undefined') user.state = state;
+    if (hobbies !== undefined) user.hobbies = Array.isArray(hobbies) ? hobbies : [];
+    if (foodPreferences !== undefined) user.foodPreferences = Array.isArray(foodPreferences) ? foodPreferences : [];
 
     await user.save();
 
     res.json({ success: true, data: user });
   } catch (error) {
+    console.error('Update profile error:', error);
+    res.status(500).json({ success: false, message: error.message });
+  }
+};
+
+// @desc    Send OTP for phone number change
+// @route   POST /api/auth/send-phone-change-otp
+// @access  Private
+const sendPhoneChangeOTP = async (req, res) => {
+  try {
+    const { newPhone } = req.body;
+
+    if (!newPhone) {
+      return res.status(400).json({ success: false, message: 'New phone number is required' });
+    }
+
+    // Validate phone number format (10 digits)
+    if (!/^[0-9]{10}$/.test(newPhone)) {
+      return res.status(400).json({ success: false, message: 'Phone number must be 10 digits' });
+    }
+
+    // Check if phone is already in use by another user
+    const existingUser = await User.findOne({ phone: newPhone });
+    if (existingUser && existingUser._id.toString() !== req.user.id) {
+      return res.status(400).json({ success: false, message: 'Phone number already in use' });
+    }
+
+    // Generate OTP
+    const otp = generateOTP();
+    const otpExpiry = new Date(Date.now() + 10 * 60 * 1000); // 10 minutes
+
+    // Store OTP temporarily (using phone change specific fields)
+    const user = await User.findById(req.user.id);
+    user.phoneChangeOTP = otp;
+    user.phoneChangeOTPExpiry = otpExpiry;
+    user.pendingPhoneNumber = newPhone;
+    await user.save();
+
+    // Send OTP via SMS
+    await sendSMS(newPhone, `Your SafeStay Hub phone change verification code is: ${otp}. This code will expire in 10 minutes.`);
+
+    res.status(200).json({
+      success: true,
+      message: 'OTP sent to new phone number',
+    });
+  } catch (error) {
+    console.error('Send phone change OTP error:', error);
+    res.status(500).json({ success: false, message: error.message });
+  }
+};
+
+// @desc    Verify OTP and update phone number
+// @route   POST /api/auth/verify-phone-change-otp
+// @access  Private
+const verifyPhoneChangeOTP = async (req, res) => {
+  try {
+    const { newPhone, otp } = req.body;
+
+    if (!newPhone || !otp) {
+      return res.status(400).json({ success: false, message: 'Phone number and OTP are required' });
+    }
+
+    const user = await User.findById(req.user.id);
+
+    if (!user.phoneChangeOTP || !user.phoneChangeOTPExpiry) {
+      return res.status(400).json({ success: false, message: 'No OTP found. Please request a new OTP.' });
+    }
+
+    if (user.phoneChangeOTPExpiry < new Date()) {
+      return res.status(400).json({ success: false, message: 'OTP has expired. Please request a new OTP.' });
+    }
+
+    if (user.phoneChangeOTP !== otp) {
+      return res.status(400).json({ success: false, message: 'Invalid OTP' });
+    }
+
+    if (user.pendingPhoneNumber !== newPhone) {
+      return res.status(400).json({ success: false, message: 'Phone number mismatch' });
+    }
+
+    // Update phone number
+    user.phone = newPhone;
+    user.phoneChangeOTP = undefined;
+    user.phoneChangeOTPExpiry = undefined;
+    user.pendingPhoneNumber = undefined;
+    await user.save();
+
+    res.status(200).json({
+      success: true,
+      message: 'Phone number updated successfully',
+      data: user
+    });
+  } catch (error) {
+    console.error('Verify phone change OTP error:', error);
     res.status(500).json({ success: false, message: error.message });
   }
 };
@@ -384,4 +524,127 @@ const refreshTokenController = async (req, res) => {
   }
 };
 
-module.exports = { register, login, getMe, updateProfile, verifyOTP, resendOTP, refreshTokenController };
+// @desc    Change user password
+// @route   PUT /api/auth/change-password
+// @access  Private
+const changePassword = async (req, res) => {
+  try {
+    const { currentPassword, newPassword } = req.body;
+
+    if (!currentPassword || !newPassword) {
+      return res.status(400).json({ success: false, message: 'Current password and new password are required' });
+    }
+
+    if (newPassword.length < 6) {
+      return res.status(400).json({ success: false, message: 'New password must be at least 6 characters long' });
+    }
+
+    // Get user with password field
+    const user = await User.findById(req.user.id).select('+password');
+
+    if (!user) {
+      return res.status(404).json({ success: false, message: 'User not found' });
+    }
+
+    // Verify current password
+    const isPasswordMatch = await user.matchPassword(currentPassword);
+    if (!isPasswordMatch) {
+      return res.status(401).json({ success: false, message: 'Current password is incorrect' });
+    }
+
+    // Update password
+    user.password = newPassword;
+    await user.save();
+
+    res.status(200).json({
+      success: true,
+      message: 'Password changed successfully'
+    });
+  } catch (error) {
+    console.error('Change password error:', error);
+    res.status(500).json({ success: false, message: error.message });
+  }
+};
+
+// @desc    Upload profile photo
+// @route   POST /api/auth/upload-profile-photo
+// @access  Private (All authenticated users)
+const uploadProfilePhoto = async (req, res) => {
+  try {
+    const user = await User.findById(req.user.id);
+    if (!user) {
+      return res.status(404).json({ success: false, message: 'User not found' });
+    }
+
+    if (!req.file) {
+      return res.status(400).json({ success: false, message: 'No file uploaded' });
+    }
+
+    console.log('Uploading profile photo for user:', user.email);
+    console.log('File details:', { mimetype: req.file.mimetype, size: req.file.size });
+
+    // Delete old profile image from cloudinary if exists
+    if (user.profileImage && user.profileImage.includes('cloudinary')) {
+      try {
+        const urlParts = user.profileImage.split('/');
+        const publicIdWithExt = urlParts[urlParts.length - 1];
+        const publicId = publicIdWithExt.split('.')[0];
+        await cloudinary.uploader.destroy(`profile_photos/${publicId}`);
+        console.log('Old profile image deleted');
+      } catch (err) {
+        console.error('Error deleting old profile image:', err);
+        // Continue with upload even if deletion fails
+      }
+    }
+
+    // Upload new image to cloudinary from buffer
+    const b64 = Buffer.from(req.file.buffer).toString('base64');
+    const dataURI = `data:${req.file.mimetype};base64,${b64}`;
+    
+    console.log('Uploading to Cloudinary...');
+    const result = await new Promise((resolve, reject) => {
+      cloudinary.uploader.upload(dataURI, {
+        folder: 'profile_photos',
+        resource_type: 'image',
+        transformation: [
+          { width: 500, height: 500, crop: 'fill', gravity: 'face' },
+          { quality: 'auto', fetch_format: 'auto' }
+        ]
+      }, (error, result) => {
+        if (error) reject(error);
+        else resolve(result);
+      });
+    });
+
+    console.log('Upload successful:', result.secure_url);
+
+    user.profileImage = result.secure_url;
+    await user.save();
+
+    res.json({ 
+      success: true, 
+      message: 'Profile photo uploaded successfully',
+      data: { profileImage: result.secure_url } 
+    });
+  } catch (error) {
+    console.error('Upload profile photo error:', error);
+    res.status(500).json({ 
+      success: false, 
+      message: error.message || 'Failed to upload profile photo' 
+    });
+  }
+};
+
+module.exports = { 
+  register, 
+  login, 
+  getMe, 
+  updateProfile, 
+  verifyOTP, 
+  resendOTP, 
+  refreshTokenController,
+  sendPhoneChangeOTP,
+  verifyPhoneChangeOTP,
+  changePassword,
+  uploadProfilePhoto
+};

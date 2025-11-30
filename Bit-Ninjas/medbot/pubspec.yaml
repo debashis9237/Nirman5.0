@@ -1,4 +1,4 @@
-name: medbot
+name: pocketdoctor
 description: "A new Flutter project."
 # The following line prevents the package from being accidentally published to
 # pub.dev using `flutter pub publish`. This is preferred for private packages.
@@ -19,7 +19,7 @@ publish_to: 'none' # Remove this line if you wish to publish to pub.dev
 version: 1.0.0+1
 
 environment:
-  sdk: ^3.9.2
+  sdk: '>=3.4.0 <4.0.0'
 
 # Dependencies specify other packages that your package needs in order to work.
 # To automatically upgrade your package dependencies to the latest versions
@@ -30,10 +30,32 @@ environment:
 dependencies:
   flutter:
     sdk: flutter
+  google_generative_ai: ^0.4.0
+  intl: ^0.19.0 # Ensure this is compatible or update as needed
+  image_picker: ^1.1.2 # Added image_picker
+  file_picker: ^8.0.5 # Added file_picker
+  flutter_markdown: ^0.7.1 # Added for Markdown rendering
+  url_launcher: ^6.0.0 # Added url_launcher
+  csv: ^5.0.1 # Added for CSV parsing
+  http: ^1.1.0 # Added for HTTP requests (needed for medication_page.dart)
+  shared_preferences: ^2.2.2 # Added for storing user data
+  provider: ^6.1.1 # Added for state management
+  flutter_local_notifications: ^17.2.2 # Added for local notifications
+  timezone: ^0.9.4 # Added for timezone support in notifications
+  path_provider: ^2.1.4 # For temporary file paths
+  
+  # Firebase packages
+  firebase_core: ^3.6.0
+  firebase_auth: ^5.3.1
+  cloud_firestore: ^5.4.4
+  geolocator: ^13.0.1 # For location services
+  geocoding: ^3.0.0 # For location address conversion
 
   # The following adds the Cupertino Icons font to your application.
   # Use with the CupertinoIcons class for iOS style icons.
-  cupertino_icons: ^1.0.8
+  cupertino_icons: ^1.0.6
+  fl_chart: ^1.1.1
+  flutter_staggered_grid_view: ^0.7.0
 
 dev_dependencies:
   flutter_test:
@@ -44,18 +66,12 @@ dev_dependencies:
   # activated in the `analysis_options.yaml` file located at the root of your
   # package. See that file for information about deactivating specific lint
   # rules and activating additional ones.
-  flutter_lints: ^5.0.0
+  flutter_lints: ^3.0.0
 
-# For information on the generic Dart part of this file, see the
-# following page: https://dart.dev/tools/pub/pubspec
-
-# The following section is specific to Flutter packages.
 flutter:
-
-  # The following line ensures that the Material Icons font is
-  # included with your application, so that you can use the icons in
-  # the material Icons class.
   uses-material-design: true
+  assets:
+    - assets/ # Ensure this is the only line for assets for now
 
   # To add assets to your application, add an assets section, like this:
   # assets:
